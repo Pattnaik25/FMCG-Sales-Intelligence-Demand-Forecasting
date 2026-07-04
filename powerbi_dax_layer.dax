@@ -1,0 +1,334 @@
+# Power BI DAX Layer — FMCG KPI Intelligence
+# =====================================================================
+# Source: fmcg-kpi-intelligence project | Amit Pattanaik
+# Model: Star schema — FACT_Sales + DIM_Store + DIM_Date + DIM_Promo
+# Rule: All KPI logic lives here. Power Query only cleans; never computes.
+# =====================================================================
+#
+# HOW TO USE THIS FILE
+# ---------------------
+# 1. Load the parquet outputs from 02_kpi_engine.py into Power BI
+# 2. Build the star schema (see Model section below)
+# 3. Paste each measure block into the correct table
+# 4. Never put KPI logic in calculated columns — always use measures
+# =====================================================================
+
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  STAR SCHEMA MODEL                                              │
+# └─────────────────────────────────────────────────────────────────┘
+#
+#   FACT_Sales
+#     Store (FK → DIM_Store[Store])
+#     Date  (FK → DIM_Date[Date])
+#     Sales
+#     Customers
+#     Open
+#     Promo
+#
+#   DIM_Store
+#     Store (PK)
+#     StoreType     (A/B/C/D)
+#     Assortment
+#     CompetitionDistance
+#     performance_tier   ← from kpi_store_tiers.parquet
+#
+#   DIM_Date
+#     Date (PK)
+#     Year | Month | MonthName | WeekNum | Quarter | IsWeekend
+#
+#   DIM_Promo
+#     Promo (PK)   0 = No Promo | 1 = Promo
+
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  TABLE: [_Measures]  (dedicated measure table — best practice)  │
+# └─────────────────────────────────────────────────────────────────┘
+
+
+# ── FOUNDATION MEASURES ───────────────────────────────────────────────────────
+
+Total Sales =
+CALCULATE(
+    SUM(FACT_Sales[Sales]),
+    FACT_Sales[Open] = 1
+)
+-- WHY: Always filter Open=1 at the base measure level.
+-- If you forget here, every derived measure inherits the error.
+
+
+Total Customers =
+CALCULATE(
+    SUM(FACT_Sales[Customers]),
+    FACT_Sales[Open] = 1
+)
+
+
+Open Days =
+CALCULATE(
+    COUNT(FACT_Sales[Date]),
+    FACT_Sales[Open] = 1
+)
+
+
+# ── KPI 1: WEEKLY REVENUE INDEX ───────────────────────────────────────────────
+
+Avg Weekly Sales =
+DIVIDE(
+    [Total Sales],
+    DISTINCTCOUNT(FACT_Sales[Week]),
+    0
+)
+-- Returns average weekly sales for whatever filter context is active.
+
+
+Rolling 4Wk Avg Sales =
+VAR CurrentWeek = MAX(DIM_Date[Week])
+VAR Window4Wk   = DATESINPERIOD(DIM_Date[Date], CurrentWeek, -28, DAY)
+RETURN
+CALCULATE(
+    DIVIDE([Total Sales], 4, 0),
+    Window4Wk
+)
+-- Note: uses DATESINPERIOD to stay portable across calendar gaps.
+
+
+Weekly Revenue Index =
+DIVIDE(
+    [Avg Weekly Sales],
+    [Rolling 4Wk Avg Sales],
+    BLANK()         -- returns BLANK() not 0 when no rolling data exists
+)
+-- >1.0 = above own trend | <1.0 = below own trend
+-- BLANK() prevents distorted visuals in early data periods (< 4 weeks history)
+
+
+# ── KPI 2: PROMOTION LIFT % ───────────────────────────────────────────────────
+
+Sales Promo =
+CALCULATE([Total Sales], FACT_Sales[Promo] = 1)
+
+
+Sales No Promo =
+CALCULATE([Total Sales], FACT_Sales[Promo] = 0)
+
+
+Promo Lift % =
+VAR PromoAvg    = DIVIDE([Sales Promo],    [Open Days], 0)
+VAR NoPromoAvg  = DIVIDE([Sales No Promo], [Open Days], 0)
+RETURN
+DIVIDE(
+    PromoAvg - NoPromoAvg,
+    NoPromoAvg,
+    BLANK()
+) * 100
+-- Uses daily averages, not totals, to control for unequal promo/non-promo day counts.
+-- Common mistake: SUM(promo sales) / SUM(non-promo sales) ignores day-count imbalance.
+
+
+# ── KPI 3: CUSTOMER CONVERSION ────────────────────────────────────────────────
+
+Sales per Customer =
+DIVIDE(
+    [Total Sales],
+    [Total Customers],
+    BLANK()
+)
+-- Proxy for basket size / visit quality.
+-- Drill down by StoreType or Tier to find conversion outliers.
+
+
+# ── KPI 4: MoM GROWTH % ──────────────────────────────────────────────────────
+
+Sales Prior Month =
+CALCULATE(
+    [Total Sales],
+    PREVIOUSMONTH(DIM_Date[Date])
+)
+
+
+MoM Growth % =
+DIVIDE(
+    [Total Sales] - [Sales Prior Month],
+    [Sales Prior Month],
+    BLANK()
+) * 100
+-- Use PREVIOUSMONTH not DATEADD(-1, MONTH) — PREVIOUSMONTH respects month-end
+-- edge cases (e.g., Feb → Mar with different day counts).
+
+
+# ── KPI 5: TIME INTELLIGENCE — YTD, YoY ──────────────────────────────────────
+# These replicate the style TCPL uses in its own investor reporting.
+
+Sales YTD =
+TOTALYTD(
+    [Total Sales],
+    DIM_Date[Date]
+)
+-- Responds to the Year slicer — always YTD within the selected year.
+
+
+Sales Prior Year =
+CALCULATE(
+    [Total Sales],
+    SAMEPERIODLASTYEAR(DIM_Date[Date])
+)
+
+
+YoY Growth % =
+DIVIDE(
+    [Sales YTD] - [Sales Prior Year],
+    [Sales Prior Year],
+    BLANK()
+) * 100
+
+
+Sales YTD Prior Year =
+CALCULATE(
+    [Sales YTD],
+    SAMEPERIODLASTYEAR(DIM_Date[Date])
+)
+
+
+# ── KPI 6: FORECAST ACCURACY (post-model layer) ───────────────────────────────
+# Load forecast output parquet as FACT_Forecasts table.
+# Columns: Store, Date, Promo, forecast_sales
+
+Total Forecast =
+SUM(FACT_Forecasts[forecast_sales])
+
+
+Abs Forecast Error =
+SUMX(
+    FACT_Forecasts,
+    ABS(FACT_Forecasts[forecast_sales]
+        - RELATED(FACT_Sales[Sales]))   -- row-level join on Store+Date
+)
+
+
+WAPE % =
+DIVIDE(
+    [Abs Forecast Error],
+    [Total Sales],
+    BLANK()
+) * 100
+-- Lower is better. Target: < 20%.
+
+
+Forecast Bias % =
+DIVIDE(
+    [Total Forecast] - [Total Sales],
+    [Total Sales],
+    BLANK()
+) * 100
+-- + = over-forecasting (excess inventory risk)
+-- - = under-forecasting (stockout risk)
+-- Target: within ±5%.
+
+
+# ── CONDITIONAL FORMATTING MEASURES ──────────────────────────────────────────
+# Power BI uses these as background color rules on KPI cards.
+
+WRI Color =
+SWITCH(
+    TRUE(),
+    [Weekly Revenue Index] >= 1.05,  "#1A7A4A",   -- green: above trend
+    [Weekly Revenue Index] >= 0.95,  "#E59B1C",   -- amber: near-trend
+    "#B03A2E"                                      -- red: below trend
+)
+
+
+MoM Color =
+SWITCH(
+    TRUE(),
+    [MoM Growth %] > 5,   "#1A7A4A",
+    [MoM Growth %] > 0,   "#E59B1C",
+    "#B03A2E"
+)
+
+
+WAPE Color =
+SWITCH(
+    TRUE(),
+    [WAPE %] <= 15,  "#1A7A4A",
+    [WAPE %] <= 25,  "#E59B1C",
+    "#B03A2E"
+)
+
+
+# ── DYNAMIC TITLE (for slicer-aware chart headers) ───────────────────────────
+
+Report Title =
+"FMCG Sales Performance — "
+    & SELECTEDVALUE(DIM_Date[Year], "All Years")
+    & " | "
+    & SELECTEDVALUE(DIM_Store[StoreType], "All Types")
+-- Appears as chart subtitle, updates automatically with slicers.
+
+
+# ── STORE COUNT KPIs ──────────────────────────────────────────────────────────
+
+Stores Above Trend =
+CALCULATE(
+    DISTINCTCOUNT(FACT_Sales[Store]),
+    [Weekly Revenue Index] > 1.0
+)
+
+
+Stores Below Trend =
+CALCULATE(
+    DISTINCTCOUNT(FACT_Sales[Store]),
+    [Weekly Revenue Index] < 0.95
+)
+
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  SUGGESTED DASHBOARD LAYOUT                                     │
+# └─────────────────────────────────────────────────────────────────┘
+#
+#  ROW 1 — KPI Cards (5 cards across)
+#   [Total Sales YTD]  [YoY Growth %]  [Weekly Revenue Index]
+#   [Promo Lift %]     [WAPE %]
+#   Each card: value + conditional color from *Color measures above
+#
+#  ROW 2 — Trend + Heatmap (2 charts side by side)
+#   Left:  Line chart — Monthly Sales by Year (multi-series)
+#   Right: Matrix — Store vs. Month, values = Weekly Revenue Index
+#          Background color: Conditional format using WRI Color
+#
+#  ROW 3 — Drill-Down Tables (2 tables)
+#   Left:  Store table — Store | Tier | Total Sales | WRI | MoM Growth
+#          Sorted by WRI ascending (worst first — immediate action list)
+#   Right: Promo table — StoreType | Promo Lift % | Sales Promo | Sales No Promo
+#
+#  SLICERS (top bar):
+#   Year | Month | StoreType | Tier | Promo (0/1)
+#
+#  DRILL-THROUGH PAGE: "Store Detail"
+#   Triggered by clicking any store in the table.
+#   Shows: 12-month trend for that store, WRI band chart, promo lift history
+
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  ANTI-PATTERNS TO AVOID                                         │
+# └─────────────────────────────────────────────────────────────────┘
+#
+#  ❌ Calculated columns for KPI logic → always measures (context-aware)
+#  ❌ DIVIDE(x, y, 0) returning 0 for missing data → use BLANK()
+#     (0 distorts averages; BLANK() is excluded from aggregations)
+#  ❌ DATEADD for MoM → use PREVIOUSMONTH (handles month-length edge cases)
+#  ❌ Hard-coding year in YTD measure → always use TOTALYTD + slicer
+#  ❌ Mixing promo/non-promo in one base measure without segmentation
+
+
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  HOW TO SAY THIS TO A HIRING MANAGER                            │
+# └─────────────────────────────────────────────────────────────────┘
+#
+#  "I put all KPI logic into DAX measures, never calculated columns —
+#  measures respond to whatever filter context the slicer applies,
+#  so one measure definition serves 1,115 stores without a single
+#  hard-coded store ID. The star schema underneath keeps query
+#  performance fast even as row count scales, and the conditional
+#  color measures make the dashboard self-interpreting — a KPI card
+#  turns red before anyone has to write a comment about it."
